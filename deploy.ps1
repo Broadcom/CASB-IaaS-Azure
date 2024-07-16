@@ -7,6 +7,8 @@ $location = "eastus"
 $resourceGroup = "cloudsoc-azure-functions-rg-$randomIdentifier"
 $storage =  "cloudsocstg$randomIdentifier"
 $functionApp = "cloudsoc-powershell-function-$randomIdentifier"
+$tag = @{} # If you want to assign tags, please update the value like @{"Department"="IT","Env"="QA"}. If resource already exists, new tags will be appended
+$lable_eventSub = "cloudsoc" #This lable will be assigned to event subscription
 $global:existingResourceGroup = $true
 $global:existingStorageAccount = $true
 $global:existingFunctionApp = $true
@@ -19,6 +21,19 @@ $runTimeVersion = "7.2"
 $funcVersion = "4"
 $rolestobeused = "EventGrid Contributor", "EventGrid Data Receiver", "Reader and Data Access"
 $global:exceptions = ""
+
+function CombineHash([ScriptBlock]$Operator) {
+    $Out = @{}
+    ForEach ($h in $Input) {
+        If ($h -is [Hashtable]) {
+            ForEach ($Key in $h.Keys) {
+                If (-Not ($Out.ContainsKey($Key))) {$Out.Add($Key,$h[$Key])}
+            }
+        }
+    }
+    If ($Operator) {ForEach ($Key in @($Out.Keys)) {$_ = @($Out.$Key); $Out.$Key = Invoke-Command $Operator}}
+    $Out
+}
 
 function Store-Exceptions-In-File() {
     $exceptionkeypath = $functionApp + '_exception_details'
@@ -120,7 +135,8 @@ function Create-Event-Subscription($event_sub_name, $app_id) {
     " --endpoint " + $app_id +  
     " --endpoint-type azurefunction" +
     " --included-event-types " + $includedEventTypes + 
-    " --advanced-filter subject StringContains storageAccounts"
+    " --advanced-filter subject StringContains storageAccounts" + 
+    " --label " + $lable_eventSub
 
     #Helper function to call azure shell commands
     Write-Host $execute_cmd
@@ -138,8 +154,13 @@ function Create-ResourceGroup() {
         $rg = Get-AzResourceGroup -Name $resourceGroup -Location $location -ErrorVariable notPresent -ErrorAction SilentlyContinue
         if ($notPresent) {
             Write-Host "Creating Resource Group - $resourceGroup in $location..."
-            $rg = New-AzResourceGroup -Name $resourceGroup -Location $location
+            $rg = New-AzResourceGroup -Name $resourceGroup -Location $location -Tag $tag
             $global:existingResourceGroup = $false
+        }
+        else{
+            $resourcetags = (Get-AzResourceGroup -Name $resourceGroup -Location $location).Tags
+            $resourcetags = $resourcetags , $tag | CombineHash
+            Set-AzureRmResourceGroup -Name $resourceGroup -Tag $resourcetags
         }
         return $rg
     }
@@ -147,6 +168,7 @@ function Create-ResourceGroup() {
         $str = "Exception occured in while creating resource group : " + $resourceGroup + " in subscription:" + $currsub 
         Write-Error $str
         $global:exceptions += $str + $_
+        Write-Error $global:exceptions
     }
 }
 
@@ -156,8 +178,13 @@ function Create-StorageAccount(){
         $storageacc = Get-AzStorageAccount -Name $storage -ResourceGroupName $resourceGroup -ErrorVariable notPresent -ErrorAction SilentlyContinue
         if ($notPresent) {
             Write-Host "Creating Storage Account - $storage"
-            $storageacc = New-AzStorageAccount -Name $storage -Location $location -ResourceGroupName $resourceGroup -SkuName $skuStorage
+            $storageacc = New-AzStorageAccount -Name $storage -Location $location -ResourceGroupName $resourceGroup -SkuName $skuStorage -Tag $tag
             $global:existingStorageAccount = $false
+        }
+        else{
+            $resourcetags = (Get-AzStorageAccount -Name $storage -ResourceGroupName $resourceGroup).Tags
+            $resourcetags = $resourcetags , $tag | CombineHash
+            Set-AzStorageAccount -Name $storage -ResourceGroupName $resourceGroup -Tag $resourcetags
         }
         return $storageacc
     }
@@ -175,11 +202,16 @@ function Create-FunctionApp(){
         $web_app = Get-AzWebApp -ResourceGroupName $resourceGroup -Name $functionApp -ErrorVariable notPresent -ErrorAction SilentlyContinue
         if ($notPresent) {
             Write-Host "Creating Function App - $functionApp"
-            New-AzFunctionApp -Name $functionApp -StorageAccountName $storage -Location $location -ResourceGroupName $resourceGroup -OSType $osType -Runtime $runTime -RuntimeVersion $runTimeVersion -FunctionsVersion $funcVersion -IdentityType "SystemAssigned"
+            New-AzFunctionApp -Name $functionApp -StorageAccountName $storage -Location $location -ResourceGroupName $resourceGroup -OSType $osType -Runtime $runTime -RuntimeVersion $runTimeVersion -FunctionsVersion $funcVersion -IdentityType "SystemAssigned" -Tag $tag
             $global:existingFunctionApp = $false
             # Publish Azure web app to Newly created function App
             Write-Host "Publishing Code in Function App $functionApp"
             Publish-AzWebapp -ArchivePath $archivePath -Name $functionApp -ResourceGroupName $resourceGroup -Force
+        }
+        else{
+            $resourcetags = (Get-AzWebApp -ResourceGroupName $resourceGroup -Name $functionApp).Tags
+            $resourcetags = $resourcetags , $tag | CombineHash
+            Update-AzFunctionApp -ResourceGroupName $resourceGroup -Name $functionApp -Tag $resourcetags -Force
         }
     }
     catch {
@@ -256,6 +288,8 @@ function Configure-Subscriptions($allsubs){
                     Assign-Role-FunctionApp $currsub
                     $web_app = Get-AzWebApp -ResourceGroupName $resourceGroup -Name $functionApp -ErrorVariable notPresent -ErrorAction SilentlyContinue
                     $endpoint = $web_app.Id + "/functions/AddWebHookToNewStorageAccount"
+                    Write-Host "Sleeping for 10 seconds, so function publishing gets complete"
+                    Start-Sleep -s 10 
                     Create-Event-Subscription $event_sub_name $endpoint
                     Write-Host "Configuration is successful for subscription - " + $currsub -ForegroundColor Green
                 }
